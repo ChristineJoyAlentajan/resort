@@ -3,7 +3,6 @@ session_start();
 require_once 'config/db.php';
 require_once 'config/auth.php';
 
-// Check login and permissions
 if (!isLoggedIn()) {
     header("Location: login.php");
     exit();
@@ -15,12 +14,10 @@ $action = $_GET['action'] ?? 'list';
 $message = '';
 $receiptPayment = null;
 
-// Helper: format currency
 function formatMoney($amount) {
     return '$' . number_format($amount, 2);
 }
 
-// Fetch booking details by ID
 function getBooking($id) {
     global $conn;
     $id = (int)$id;
@@ -33,12 +30,15 @@ function getBooking($id) {
     return $conn->query($sql)->fetch_assoc();
 }
 
-// Handle payment recording
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && $action === 'record') {
+    ini_set('display_errors', 0);
+    error_reporting(E_ALL & ~E_WARNING & ~E_NOTICE);
+
+    header('Content-Type: application/json');
+
     $booking_id = (int)($_POST['booking_id'] ?? 0);
     $amount = (float)($_POST['amount'] ?? 0);
     $method = sanitize($_POST['payment_method'] ?? 'cash');
-    // Map new front-end option to stored DB value (enum still uses online_transfer)
     $methodForDb = $method === 'digital_bank' ? 'online_transfer' : $method;
     $transaction_id = sanitize($_POST['transaction_id'] ?? '');
     $notes = sanitize($_POST['notes'] ?? '');
@@ -46,50 +46,66 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $action === 'record') {
     $booking = getBooking($booking_id);
 
     if (!$booking) {
-        $message = '<div class="alert alert-danger">Booking not found.</div>';
-    } elseif ($amount <= 0) {
-        $message = '<div class="alert alert-danger">Please enter a valid payment amount.</div>';
-    } else {
-        $due = max(0, $booking['total_price'] - $booking['paid_amount']);
-        if ($amount > $due) {
-            $message = '<div class="alert alert-warning">Payment amount exceeds balance due. Please adjust.</div>';
-        } else {
-            // Insert payment record
-            $sql = "INSERT INTO payments (booking_id, amount, payment_method, transaction_id, notes) 
-                    VALUES ($booking_id, $amount, '$methodForDb', '$transaction_id', '$notes')";
-            if ($conn->query($sql)) {
-                // Update booking payment status if fully paid
-                $newPaidTotal = $booking['paid_amount'] + $amount;
-                $newStatus = ($newPaidTotal >= $booking['total_price']) ? 'paid' : 'pending';
-                $conn->query("UPDATE bookings SET payment_status = '$newStatus' WHERE id = $booking_id");
-
-                // Fetch newly inserted payment for receipt
-                $payment_id = $conn->insert_id;
-                $receiptPayment = $conn->query("SELECT p.*, b.booking_number, g.first_name, g.last_name, r.room_number, r.room_type
-                    FROM payments p
-                    JOIN bookings b ON p.booking_id = b.id
-                    JOIN guests g ON b.guest_id = g.id
-                    JOIN rooms r ON b.room_id = r.id
-                    WHERE p.id = $payment_id")->fetch_assoc();
-
-                $message = '<div class="alert alert-success">Payment recorded successfully!</div>';
-                // Refresh booking data to reflect the updated paid amount
-                $selectedBooking = getBooking($booking_id);
-                $action = 'pay';
-            } else {
-                $message = '<div class="alert alert-danger">Error: ' . $conn->error . '</div>';
-            }
-        }
+        echo json_encode(['success' => false, 'message' => 'Booking not found.']);
+        exit;
     }
+
+    if ($amount < 0) {
+        echo json_encode(['success' => false, 'message' => 'Please enter a valid payment amount.']);
+        exit;
+    }
+
+    $due = max(0, $booking['total_price'] - $booking['paid_amount']);
+    if ($amount === 0) {
+        $amount = $due;
+    }
+
+    $sql = "INSERT INTO payments (booking_id, amount, payment_method, transaction_id, notes) 
+            VALUES ($booking_id, $amount, '$methodForDb', '$transaction_id', '$notes')";
+
+    if (!$conn->query($sql)) {
+        echo json_encode(['success' => false, 'message' => 'Error: ' . $conn->error]);
+        exit;
+    }
+
+    $newPaidTotal = $booking['paid_amount'] + $amount;
+    $newStatus = ($newPaidTotal >= $booking['total_price']) ? 'paid' : 'pending';
+    $conn->query("UPDATE bookings SET payment_status = '$newStatus' WHERE id = $booking_id");
+
+    $receiptPayment = $conn->query("SELECT p.*, b.booking_number, g.first_name, g.last_name, r.room_number, r.room_type
+        FROM payments p
+        JOIN bookings b ON p.booking_id = b.id
+        JOIN guests g ON b.guest_id = g.id
+        JOIN rooms r ON b.room_id = r.id
+        WHERE p.booking_id = $booking_id
+        ORDER BY p.id DESC
+        LIMIT 1")->fetch_assoc();
+
+    if (!$receiptPayment) {
+        echo json_encode(['success' => false, 'message' => 'Unable to load payment receipt.']);
+        exit;
+    }
+
+    $receiptData = [
+        'booking_number' => $receiptPayment['booking_number'] ?? '',
+        'guest' => trim(($receiptPayment['first_name'] ?? '') . ' ' . ($receiptPayment['last_name'] ?? '')),
+        'room' => trim(($receiptPayment['room_number'] ?? '') . ' (' . ucfirst($receiptPayment['room_type'] ?? '') . ')'),
+        'amount' => number_format($receiptPayment['amount'] ?? 0, 2),
+        'method' => ($receiptPayment['payment_method'] ?? '') === 'online_transfer' ? 'Digital Bank Transfer' : str_replace('_', ' ', ucfirst($receiptPayment['payment_method'] ?? '')),
+        'transaction_id' => $receiptPayment['transaction_id'] ?? '',
+        'notes' => $receiptPayment['notes'] ?? '',
+        'payment_date' => date('Y-m-d H:i:s', strtotime($receiptPayment['payment_date'] ?? '')), 
+    ];
+
+    echo json_encode(['success' => true, 'receipt' => $receiptData]);
+    exit;
 }
 
-// Load booking for payment form if requested
 $selectedBooking = null;
 if ($action === 'pay' && isset($_GET['id'])) {
     $selectedBooking = getBooking((int)$_GET['id']);
 }
 
-// Get bookings list with payment info
 $bookingsQuery = "SELECT b.*, g.first_name, g.last_name, r.room_number, r.room_type,
     (SELECT COALESCE(SUM(amount), 0) FROM payments p WHERE p.booking_id = b.id) AS paid_amount
     FROM bookings b
@@ -137,6 +153,7 @@ include 'views/header.php';
                     <tbody>
                         <?php while ($b = $bookings->fetch_assoc()):
                             $due = max(0, $b['total_price'] - $b['paid_amount']);
+                            $shouldPay = ($b['payment_status'] === 'pending');
                         ?>
                         <tr>
                             <td><strong><?php echo htmlspecialchars($b['booking_number']); ?></strong></td>
@@ -151,12 +168,23 @@ include 'views/header.php';
                                 </span>
                             </td>
                             <td>
-                                <?php if ($due > 0): ?>
-                                    <a href="payments.php?action=pay&id=<?php echo $b['id']; ?>" class="btn btn-sm btn-success">
+                                <?php if ($shouldPay): ?>
+                                    <button type="button" class="btn btn-sm btn-success payBtn" 
+                                        data-bs-toggle="modal" data-bs-target="#paymentModal"
+                                        data-booking-id="<?php echo $b['id']; ?>"
+                                        data-booking-number="<?php echo htmlspecialchars($b['booking_number']); ?>"
+                                        data-guest="<?php echo htmlspecialchars($b['first_name'] . ' ' . $b['last_name']); ?>"
+                                        data-room="<?php echo htmlspecialchars($b['room_number'] . ' (' . ucfirst($b['room_type']) . ')'); ?>"
+                                        data-checkin="<?php echo htmlspecialchars($b['check_in_date']); ?>"
+                                        data-checkout="<?php echo htmlspecialchars($b['check_out_date']); ?>"
+                                        data-total="<?php echo number_format($b['total_price'], 2, '.', ''); ?>"
+                                        data-paid="<?php echo number_format($b['paid_amount'], 2, '.', ''); ?>"
+                                        data-due="<?php echo number_format($due, 2, '.', ''); ?>"
+                                    >
                                         <i class="fas fa-credit-card"></i> Pay
-                                    </a>
+                                    </button>
                                 <?php else: ?>
-                                    <span class="text-muted">No balance</span>
+                                    <span class="text-muted">No payment required</span>
                                 <?php endif; ?>
                             </td>
                         </tr>
@@ -166,6 +194,265 @@ include 'views/header.php';
             </div>
         </div>
     </div>
+
+    <!-- Payment Modal -->
+    <div class="modal fade" id="paymentModal" tabindex="-1" aria-labelledby="paymentModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-lg modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="paymentModalLabel">Record Payment</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="paymentAlert"></div>
+
+                    <div id="paymentDetails" class="mb-3">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <p><strong>Booking:</strong> <span id="modalBookingNumber"></span></p>
+                                <p><strong>Guest:</strong> <span id="modalGuest"></span></p>
+                                <p><strong>Room:</strong> <span id="modalRoom"></span></p>
+                            </div>
+                            <div class="col-md-6">
+                                <p><strong>Stay:</strong> <span id="modalStay"></span></p>
+                                <p><strong>Total:</strong> <span id="modalTotal"></span></p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <form id="paymentForm" method="POST" action="payments.php?action=record">
+                        <input type="hidden" name="booking_id" id="modalBookingId" value="">
+
+                        <div class="row">
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Payment Amount *</label>
+                            <input type="number" step="0.01" min="0" class="form-control" name="amount" id="modalAmount" readonly required>
+                            <div class="form-check mt-1">
+                                <input class="form-check-input" type="checkbox" value="" id="modalCustomAmount">
+                                <label class="form-check-label" for="modalCustomAmount">Edit amount (partial payment)</label>
+                            </div>
+                            <small class="form-text text-muted">Amount defaults to balance due and will be recorded when you submit.</small>
+                            </div>
+                            <div class="col-md-6 mb-3">
+                                <label class="form-label">Payment Method *</label>
+                                <select class="form-control" name="payment_method" id="modalMethod" required>
+                                    <option value="cash">Cash (Walk-in)</option>
+                                    <option value="credit_card">Card</option>
+                                    <option value="digital_bank">Digital Bank Transfer</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div id="modalDigitalBank" style="display: none;" class="mb-3">
+                            <div class="alert alert-info">
+                                <strong>Digital Bank Transfer</strong><br>
+                                Scan the QR code below in your banking app.
+                            </div>
+                            <div class="d-flex justify-content-center mb-2">
+                                <img id="modalQr" src="" alt="Digital Bank QR" style="max-width: 220px;" />
+                            </div>
+                        </div>
+
+                        <div id="modalCard" style="display: none;" class="mb-3">
+                            <div class="alert alert-info">
+                                <strong>Card Payment</strong><br>
+                                Please process the card payment using your card terminal (POS machine).
+                                Then enter the transaction reference ID below.
+                            </div>
+                            <div class="mb-3">
+                                <label class="form-label">Transaction ID</label>
+                                <input type="text" class="form-control" name="transaction_id" value="TRX<?php echo time(); ?>" placeholder="Terminal transaction reference">
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label">Notes</label>
+                            <textarea class="form-control" name="notes" rows="2" placeholder="Optional notes (e.g., payment details)"></textarea>
+                        </div>
+
+                        <div class="d-flex justify-content-between">
+                            <button type="submit" class="btn btn-success" id="modalSubmitBtn">
+                                <i class="fas fa-check-circle"></i> Record Payment
+                            </button>
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                        </div>
+                    </form>
+
+                    <div id="modalReceipt" style="display: none;" class="mt-4">
+                        <hr>
+                        <h5>Receipt</h5>
+                        <div id="modalReceiptBody"></div>
+                        <div class="text-end mt-3">
+                            <button class="btn btn-primary" id="modalPrintBtn">
+                                <i class="fas fa-print"></i> Print Receipt
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const paymentModalEl = document.getElementById('paymentModal');
+        const modalBookingId = document.getElementById('modalBookingId');
+        const modalBookingNumber = document.getElementById('modalBookingNumber');
+        const modalGuest = document.getElementById('modalGuest');
+        const modalRoom = document.getElementById('modalRoom');
+        const modalStay = document.getElementById('modalStay');
+        const modalTotal = document.getElementById('modalTotal');
+        const modalAmount = document.getElementById('modalAmount');
+        const modalCustomAmount = document.getElementById('modalCustomAmount');
+        const modalMethod = document.getElementById('modalMethod');
+        const modalCard = document.getElementById('modalCard');
+        const modalDigitalBank = document.getElementById('modalDigitalBank');
+        const modalQr = document.getElementById('modalQr');
+        const paymentAlert = document.getElementById('paymentAlert');
+        const paymentForm = document.getElementById('paymentForm');
+        const modalReceipt = document.getElementById('modalReceipt');
+        const modalReceiptBody = document.getElementById('modalReceiptBody');
+        const modalPrintBtn = document.getElementById('modalPrintBtn');
+
+        function buildQrPayload(bookingNumber, amount) {
+            const cleanedAmount = parseFloat(amount) || 0;
+            return `PAYTO:CrizelsResort|BOOKING:${bookingNumber}|AMOUNT:${cleanedAmount.toFixed(2)}|BANK:CrizelsResortBank|ACC:123456789`;
+        }
+
+        function updateModalQr() {
+            if (!modalQr) return;
+            const bookingNumber = modalBookingNumber.textContent || '';
+            const amount = modalAmount.value || '0';
+            const payload = buildQrPayload(bookingNumber, amount);
+            modalQr.src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(payload);
+        }
+
+        function updatePaymentFields() {
+            const method = modalMethod.value;
+            const showCard = method === 'credit_card';
+            const showDigital = method === 'digital_bank';
+
+            if (modalCard) modalCard.style.display = showCard ? 'block' : 'none';
+            if (modalDigitalBank) modalDigitalBank.style.display = showDigital ? 'block' : 'none';
+            if (showDigital) updateModalQr();
+        }
+
+        function showAlert(type, message) {
+            if (!paymentAlert) return;
+            paymentAlert.innerHTML = `<div class="alert alert-${type} alert-dismissible" role="alert">${message}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>`;
+        }
+
+        function setReceipt(data) {
+            if (!modalReceiptBody) return;
+            modalReceiptBody.innerHTML = `
+                <p><strong>Booking:</strong> ${data.booking_number}</p>
+                <p><strong>Guest:</strong> ${data.guest}</p>
+                <p><strong>Room:</strong> ${data.room}</p>
+                <p><strong>Payment:</strong> $${data.amount} (${data.method})</p>
+                <p><strong>Transaction ID:</strong> ${data.transaction_id}</p>
+                <p><strong>Date:</strong> ${data.payment_date}</p>
+                ${data.notes ? `<p><strong>Notes:</strong> ${data.notes}</p>` : ''}
+            `;
+            if (modalReceipt) modalReceipt.style.display = 'block';
+        }
+
+        function resetModal() {
+            if (paymentForm) paymentForm.reset();
+            if (modalReceipt) modalReceipt.style.display = 'none';
+            if (modalReceiptBody) modalReceiptBody.innerHTML = '';
+            if (paymentAlert) paymentAlert.innerHTML = '';
+        }
+
+        if (paymentModalEl) {
+            paymentModalEl.addEventListener('show.bs.modal', function (event) {
+                resetModal();
+                const button = event.relatedTarget;
+                if (!button) return;
+                const dataset = button.dataset;
+
+                modalBookingId.value = dataset.bookingId || '';
+                modalBookingNumber.textContent = dataset.bookingNumber || '';
+                modalGuest.textContent = dataset.guest || '';
+                modalRoom.textContent = dataset.room || '';
+                modalStay.textContent = `${dataset.checkin || ''} to ${dataset.checkout || ''}`;
+                modalTotal.textContent = `$${dataset.total || '0.00'}`;
+                modalAmount.value = dataset.total || '';
+                modalMethod.value = 'cash';
+                updatePaymentFields();
+            });
+        }
+
+        if (modalMethod) {
+            modalMethod.addEventListener('change', updatePaymentFields);
+        }
+
+        if (modalAmount) {
+            modalAmount.addEventListener('input', updateModalQr);
+        }
+
+        if (modalCustomAmount) {
+            modalCustomAmount.addEventListener('change', function () {
+                if (!modalAmount) return;
+                modalAmount.readOnly = !this.checked;
+                if (!this.checked) {
+                    modalAmount.value = modalTotal.textContent.replace(/[^0-9\.]/g, '');
+                    updateModalQr();
+                }
+            });
+        }
+
+        if (paymentForm) {
+            paymentForm.addEventListener('submit', function (e) {
+                e.preventDefault();
+
+                const formData = new FormData(paymentForm);
+                fetch('payments.php?action=record', {
+                    method: 'POST',
+                    body: formData,
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest'
+                    }
+                })
+                .then(res => res.text())
+                .then(text => {
+                    let data;
+                    try {
+                        data = JSON.parse(text);
+                    } catch (e) {
+                        showAlert('danger', 'Unexpected server response. Please refresh and try again.');
+                        console.error('Payment API parsing error:', e, text);
+                        return;
+                    }
+
+                    if (data.success) {
+                        showAlert('success', 'Payment recorded successfully.');
+                        setReceipt(data.receipt);
+
+                        setTimeout(() => window.location.reload(), 1200);
+                    } else {
+                        showAlert('danger', data.message || 'Unable to record payment.');
+                    }
+                })
+                .catch((err) => {
+                    console.error(err);
+                    showAlert('danger', 'Unexpected error.');
+                });
+            });
+        }
+
+        if (modalPrintBtn) {
+            modalPrintBtn.addEventListener('click', function () {
+                const receiptHtml = modalReceiptBody.innerHTML;
+                const printWindow = window.open('', '_blank');
+                printWindow.document.write('<html><head><title>Receipt</title></head><body>' + receiptHtml + '</body></html>');
+                printWindow.document.close();
+                printWindow.focus();
+                printWindow.print();
+                printWindow.close();
+            });
+        }
+    </script>
 
 <?php elseif ($action === 'pay'): ?>
     <div class="card">
@@ -280,29 +567,13 @@ include 'views/header.php';
                     </div>
 
                     <div id="cardDetails" style="display: none;">
-                        <div class="row">
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Cardholder Name</label>
-                                <input type="text" class="form-control" placeholder="John Doe" name="card_name">
-                            </div>
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Card Number</label>
-                                <input type="text" class="form-control" placeholder="**** **** **** 1234" name="card_number">
-                            </div>
+                        <div class="alert alert-info">
+                            <strong>Card Payment</strong><br>
+                            Process the card payment on the terminal, then provide the transaction reference below.
                         </div>
-                        <div class="row">
-                            <div class="col-md-4 mb-3">
-                                <label class="form-label">Expiry</label>
-                                <input type="text" class="form-control" placeholder="MM/YY" name="card_expiry">
-                            </div>
-                            <div class="col-md-4 mb-3">
-                                <label class="form-label">CVV</label>
-                                <input type="text" class="form-control" placeholder="123" name="card_cvv">
-                            </div>
-                            <div class="col-md-4 mb-3">
-                                <label class="form-label">Transaction ID</label>
-                                <input type="text" class="form-control" name="transaction_id" value="TRX<?php echo time(); ?>" placeholder="Optional transaction reference">
-                            </div>
+                        <div class="mb-3">
+                            <label class="form-label">Transaction ID</label>
+                            <input type="text" class="form-control" name="transaction_id" value="TRX<?php echo time(); ?>" placeholder="Terminal transaction reference">
                         </div>
                     </div>
 
