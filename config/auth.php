@@ -47,6 +47,9 @@ const ROLE_PERMISSIONS = [
         'generate_reports' => true,
         'view_income_reports' => true,
         
+        // Payments
+        'record_payments' => true,
+        
         // System Settings
         'manage_settings' => true,
         'backup_database' => true,
@@ -82,6 +85,9 @@ const ROLE_PERMISSIONS = [
         'view_reports' => true,
         'view_sales_reports' => true,
         'view_income_reports' => true,
+
+        // Payments
+        'record_payments' => true,
         
         // Customer Service
         'handle_customer_concerns' => true,

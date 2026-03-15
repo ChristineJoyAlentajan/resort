@@ -14,6 +14,9 @@
                         <li><a href="index.php" class="text-white-50">Dashboard</a></li>
                         <li><a href="rooms.php" class="text-white-50">Rooms</a></li>
                         <li><a href="bookings.php" class="text-white-50">Bookings</a></li>
+                    <?php if (hasPermission('record_payments')): ?>
+                        <li><a href="payments.php" class="text-white-50">Payments</a></li>
+                    <?php endif; ?>
                     </ul>
                 </div>
                 <div class="col-md-4">

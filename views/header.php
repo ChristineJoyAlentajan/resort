@@ -51,6 +51,12 @@ if (!isset($_SESSION['user_id'])) {
                         <a class="nav-link" href="bookings.php"><i class="bi bi-calendar-check"></i> Bookings</a>
                     </li>
                     <?php endif; ?>
+
+                    <?php if (hasPermission('record_payments')): ?>
+                    <li class="nav-item">
+                        <a class="nav-link" href="payments.php"><i class="bi bi-cash-stack"></i> Payments</a>
+                    </li>
+                    <?php endif; ?>
                     
                     <?php if (hasPermission('manage_services')): ?>
                     <li class="nav-item">
@@ -60,7 +66,7 @@ if (!isset($_SESSION['user_id'])) {
                     
                     <?php if (hasPermission('manage_staff')): ?>
                     <li class="nav-item">
-                        <a class="nav-link" href="users.php"><i class="bi bi-person-gear"></i> Staff</a>
+                        <a class="nav-link" href="users.php"><i class="bi bi-person"></i> Staff</a>
                     </li>
                     <?php endif; ?>
                     
